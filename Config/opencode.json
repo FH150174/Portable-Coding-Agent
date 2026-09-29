@@ -1,0 +1,33 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "deepseek/deepseek-flash",
+  "small_model": "deepseek/deepseek-flash",
+  "enabled_providers": [
+    "deepseek"
+  ],
+  "provider": {
+    "deepseek": {
+      "options": {
+        "apiKey": "{env:DEEPSEEK_API_KEY}",
+        "baseURL": "https://api.deepseek.com"
+      },
+      "npm": "@ai-sdk/openai-compatible"
+    }
+  },
+  "autoupdate": false,
+  "share": "disabled",
+  "formatter": false,
+  "lsp": false,
+  "plugin": [],
+  "mcp": {},
+  "permission": {
+    "edit": "ask",
+    "external_directory": "ask",
+    "webfetch": "ask",
+    "websearch": "ask",
+    "bash": {
+      "*": "ask",
+      "git push*": "deny"
+    }
+  }
+}

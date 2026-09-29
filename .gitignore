@@ -1,0 +1,19 @@
+# Public source repository: keep credentials, user projects and generated data local.
+**/deepseek.key
+**/.deepseek.key.*.tmp
+**/*.pem
+**/.env
+**/.env.*
+/Workspace/
+/Data/
+/Logs/
+/TestRuns/
+/Release/
+/Agent/
+/Vendor/
+/Scripts/Configure-Key.ps1
+/Scripts/Show-Diagnostics.ps1
+/Scripts/Start-Agent.ps1
+/Scripts/Stop-Agent.ps1
+/Codex任务提示词.md
+/Portable-Coding-Agent-软件规格草案-v0.1.md
