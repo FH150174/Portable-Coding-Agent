@@ -16,7 +16,7 @@ $expectedArchiveBytes = 62101771
 $expectedArchiveSha256 = 'cd852831bd094c2df2eb379eb98bed7a63db7f823a7caf277c732cdac33cbdb6'
 $expectedExeSha256 = 'da86eed515d91a7b2d7da9a8230a2bd095f68a89f0cf44eb6a9217bead81fffc'
 $expectedConfigSha256 = '57b2b36833676af90add9ca2875196177f4da38d336570825862374b12265472'
-$expectedLauncherSha256 = '9a503822c3b817c2280588c9e76e3b71404b11bd359c4fd162df45bab0446a35'
+$expectedLauncherSha256 = 'dcb118d93b538b27ba1071db295e6fca15dcf02fd8e7d9c993576e2108d08ee0'
 $vendorDirectory = Join-Path $sourceRoot 'Vendor'
 $archivePath = Join-Path $vendorDirectory $archiveName
 $releaseBase = Join-Path $sourceRoot 'Release'
@@ -41,12 +41,15 @@ if ($outputPath.StartsWith($sourceRoot + '\', [StringComparison]::OrdinalIgnoreC
 
 $requiredFiles = @(
     (Join-Path $sourceRoot 'Config\opencode.json'),
+    (Join-Path $sourceRoot 'Config\approval-readonly.json'),
+    (Join-Path $sourceRoot 'Config\approval-workspace.json'),
     (Join-Path $sourceRoot 'Launcher\PortableAgent.exe'),
     (Join-Path $sourceRoot 'Launcher\PortableAgent.cs'),
     (Join-Path $sourceRoot 'Launcher\SessionRelocator.cs'),
     (Join-Path $sourceRoot 'Tools\Build-Launcher.cmd'),
     (Join-Path $sourceRoot '启动 Agent.cmd'),
-    (Join-Path $sourceRoot '配置密钥.cmd')
+    (Join-Path $sourceRoot '配置密钥.cmd'),
+    (Join-Path $sourceRoot '设置审批档位.cmd')
 )
 foreach ($requiredFile in $requiredFiles) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
@@ -215,6 +218,17 @@ try {
         throw 'Pinned Config\opencode.json SHA-256 mismatch. Rebuild the native launcher after intentional config edits.'
     }
     Copy-Item -LiteralPath $sourceConfigPath -Destination (Join-Path $stagePath 'Config\opencode.json')
+    foreach ($profile in @(
+        @{ name = 'approval-readonly.json'; hash = '28a70f06ea4ac04c1542c75c67f60f52c9368d38301183ef3a0363bddb1db8a1' },
+        @{ name = 'approval-workspace.json'; hash = '3a32db90f754ffe764be0aea3fbdb44f78cd41bc74157a64965b68891aabd0ec' }
+    )) {
+        $profilePath = Join-Path (Join-Path $sourceRoot 'Config') $profile.name
+        Assert-NormalSourceFile -Path $profilePath
+        if ((Get-FileHash -LiteralPath $profilePath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $profile.hash) {
+            throw "Pinned Config\$($profile.name) SHA-256 mismatch. Rebuild the native launcher after intentional config edits."
+        }
+        Copy-Item -LiteralPath $profilePath -Destination (Join-Path $stagePath 'Config')
+    }
 
     $launcherExePath = Join-Path $sourceRoot 'Launcher\PortableAgent.exe'
     $launcherSourcePath = Join-Path $sourceRoot 'Launcher\PortableAgent.cs'

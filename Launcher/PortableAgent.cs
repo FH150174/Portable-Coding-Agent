@@ -23,6 +23,7 @@ internal sealed class ServerState
     public string exe { get; set; }
     public int port { get; set; }
     public string project { get; set; }
+    public string approvalMode { get; set; }
 }
 internal sealed class ModelsResponse
 {
@@ -43,16 +44,23 @@ internal static class PortableAgent
     private const string PinnedVersion = "1.18.32";
     private const string PinnedHash = "DA86EED515D91A7B2D7DA9A8230A2BD095F68A89F0CF44EB6A9217BEAD81FFFC";
     private const string PinnedConfigHash = "57B2B36833676AF90ADD9CA2875196177F4DA38D336570825862374B12265472";
+    private const string PinnedReadonlyConfigHash = "28A70F06EA4AC04C1542C75C67F60F52C9368D38301183EF3A0363BDDB1DB8A1";
+    private const string PinnedWorkspaceConfigHash = "3A32DB90F754FFE764BE0AEA3FBDB44F78CD41BC74157A64965B68891AABD0EC";
     private const long MinimumFreeBytes = 128L * 1024L * 1024L;
     private static readonly string Root = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
     private static readonly string Exe = Path.Combine(Root, "Agent", "opencode.exe");
     private static readonly string Config = Path.Combine(Root, "Config", "opencode.json");
+    private static readonly string ReadonlyConfig = Path.Combine(Root, "Config", "approval-readonly.json");
+    private static readonly string WorkspaceConfig = Path.Combine(Root, "Config", "approval-workspace.json");
     private static readonly string KeyFile = Path.Combine(Root, "Config", "deepseek.key");
     private static readonly string Workspace = Path.Combine(Root, "Workspace");
     private static readonly string Data = Path.Combine(Root, "Data");
     private static readonly string StateFile = Path.Combine(Data, "run", "web-server.json");
+    private static readonly string ApprovalFile = Path.Combine(Data, "run", "approval-mode.txt");
+    private static readonly string ApprovalLockFile = Path.Combine(Data, "run", "approval.lock");
     private static readonly string LogFile = Path.Combine(Root, "Logs", "launcher.log");
     private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+    private static string ApprovalMode = "manual";
     private static string ConfigText;
     private static string Key;
 
@@ -70,25 +78,39 @@ internal static class PortableAgent
             string projectArg = null;
             string apiBaseUrl = "https://api.deepseek.com";
             bool apiOverride = false;
+            string approvalLevel = null;
+            bool approvalShow = false;
             for (int i = 1; i < args.Length; i++)
             {
                 if (args[i] == "--project" && i + 1 < args.Length) projectArg = args[++i];
                 else if (args[i] == "--api-base-url" && i + 1 < args.Length) { apiBaseUrl = args[++i]; apiOverride = true; }
-                else throw new AgentError("PCA100", "参数无效。用法：PortableAgent.exe web|tui|stop|diagnose|key|verify|preflight [--project 目录] [--api-base-url 本机假服务]");
+                else if (args[i] == "--show") approvalShow = true;
+                else if (args[i] == "--level" && i + 1 < args.Length) approvalLevel = args[++i].ToLowerInvariant();
+                else throw new AgentError("PCA100", "参数无效。用法：PortableAgent.exe web|tui|stop|diagnose|key|verify|preflight|approval [--project 目录] [--level 档位]");
             }
+            if (mode == "approval")
+            {
+                if (projectArg != null || apiOverride || (approvalLevel != null && approvalShow))
+                    throw new AgentError("PCA100", "审批设置参数无效。");
+                ConfigureApproval(approvalLevel, approvalShow);
+                return 0;
+            }
+            if (approvalLevel != null || approvalShow)
+                throw new AgentError("PCA100", "--level 和 --show 只供 approval 使用。");
             if (mode == "key") { ConfigureKey(); return 0; }
             if (mode == "migrate") { CheckPlatform(); CheckStorage(); SessionRelocator.Prepare(Root, Data, Log); Console.WriteLine("会话路径检查完成。"); return 0; }
             if (mode == "verify") { VerifyPackage(); return 0; }
             if (mode == "diagnose") { Diagnose(); return 0; }
             if (mode == "stop") { StopWeb(); return 0; }
             if (mode != "web" && mode != "tui" && mode != "preflight")
-                throw new AgentError("PCA100", "未知模式；可用 web、tui、stop、diagnose、key、verify、preflight。");
+                throw new AgentError("PCA100", "未知模式；可用 web、tui、stop、diagnose、key、verify、preflight、approval。");
             if (apiOverride && mode != "preflight")
                 throw new AgentError("PCA108", "自定义 API 检查地址仅供隔离的 preflight 测试使用。");
             CheckPlatform();
             CheckExecutable();
-            CheckConfig();
             CheckStorage();
+            ApprovalMode = ReadApprovalMode();
+            CheckConfig();
             string project = GetProject(projectArg);
             CheckProjectConfiguration(project);
             ReadKey();
@@ -102,7 +124,12 @@ internal static class PortableAgent
             }
             SessionRelocator.Prepare(Root, Data, Log);
             if (mode == "tui") return RunTui(project);
-            StartWeb(project);
+            using (AcquireApprovalLock())
+            {
+                ApprovalMode = ReadApprovalMode();
+                CheckConfig();
+                StartWeb(project);
+            }
             return 0;
         }
         catch (AgentError error)
@@ -163,10 +190,108 @@ internal static class PortableAgent
         }
     }
 
+    private static string ApprovalLabel(string level)
+    {
+        switch (level)
+        {
+            case "readonly": return "只读（编辑与命令禁止）";
+            case "manual": return "逐项审批（默认）";
+            case "workspace": return "工作区编辑自动，命令审批";
+            default: throw new AgentError("PCA135", "未知审批档位。");
+        }
+    }
+
+    private static string ReadApprovalMode()
+    {
+        RejectLinkedPath(ApprovalFile);
+        if (!File.Exists(ApprovalFile)) return "manual";
+        try
+        {
+            if (new FileInfo(ApprovalFile).Length > 64)
+                throw new AgentError("PCA135", "审批设置文件过大；请检查 Data\\run\\approval-mode.txt。");
+            string level = File.ReadAllText(ApprovalFile, Encoding.UTF8).Trim().ToLowerInvariant();
+            ApprovalLabel(level);
+            return level;
+        }
+        catch (AgentError) { throw; }
+        catch { throw new AgentError("PCA135", "审批设置文件无法读取。"); }
+    }
+
+    private static void ConfigureApproval(string requested, bool showOnly)
+    {
+        CheckPlatform();
+        CheckStorage();
+        CheckConfig();
+        string current = ReadApprovalMode();
+        Console.WriteLine("当前审批档位：" + ApprovalLabel(current));
+        if (showOnly) return;
+        string selected = requested;
+        if (selected == null)
+        {
+            if (Console.IsInputRedirected)
+                throw new AgentError("PCA131", "请在交互式窗口选择档位，或使用 approval --level 档位。");
+            Console.WriteLine("1. 只读：禁止编辑和运行命令");
+            Console.WriteLine("2. 逐项审批：编辑和命令均需确认（默认）");
+            Console.WriteLine("3. 工作区编辑自动：编辑自动通过，命令仍需确认");
+            Console.Write("输入 1 至 3：");
+            string answer = Console.ReadLine();
+            switch (answer == null ? "" : answer.Trim())
+            {
+                case "1": selected = "readonly"; break;
+                case "2": selected = "manual"; break;
+                case "3": selected = "workspace"; break;
+                default: throw new AgentError("PCA131", "未选择有效档位，设置未更改。");
+            }
+        }
+        ApprovalLabel(selected);
+        using (AcquireApprovalLock())
+        {
+            current = ReadApprovalMode();
+            if (selected == current)
+            {
+                Console.WriteLine("审批档位未改变。");
+                return;
+            }
+            RejectLinkedPath(StateFile);
+            if (File.Exists(StateFile))
+                throw new AgentError("PCA132", "Web 服务记录仍在；请先运行“退出 Agent.cmd”，再切换审批档位。");
+            string temporary = ApprovalFile + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                RejectLinkedPath(ApprovalFile);
+                File.WriteAllText(temporary, selected + Environment.NewLine, new UTF8Encoding(false));
+                SessionRelocator.ReplaceFileAtomically(temporary, ApprovalFile);
+            }
+            catch (AgentError) { throw; }
+            catch { throw new AgentError("PCA133", "无法保存审批档位；请检查 U 盘写入权限。"); }
+            finally { if (File.Exists(temporary)) File.Delete(temporary); }
+            Log("审批档位已切换为 " + selected + "。");
+            Console.WriteLine("已设置为：" + ApprovalLabel(selected) + "。下次启动 Agent 生效。");
+        }
+    }
+
+    private static FileStream AcquireApprovalLock()
+    {
+        RejectLinkedPath(ApprovalLockFile);
+        DateTime deadline = DateTime.UtcNow.AddSeconds(30);
+        while (true)
+        {
+            try { return new FileStream(ApprovalLockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+            catch (IOException)
+            {
+                if (DateTime.UtcNow >= deadline)
+                    throw new AgentError("PCA134", "审批设置正被另一启动器使用；请稍后重试。");
+                Thread.Sleep(100);
+            }
+            catch { throw new AgentError("PCA134", "无法锁定 U 盘审批设置。"); }
+        }
+    }
+
     private static void VerifyPackage()
     {
         CheckPlatform();
         CheckExecutable();
+        ApprovalMode = ReadApprovalMode();
         CheckConfig();
         Console.WriteLine("离线包检查通过：OpenCode 1.18.32、SHA-256 和配置 JSON 有效。");
         Console.WriteLine("本检查未验证 Key、DeepSeek API、Web/TUI 或目标机房权限。");
@@ -257,27 +382,43 @@ internal static class PortableAgent
         catch { throw new AgentError("PCA102", "无法检查或执行 OpenCode；请检查程序文件和电脑运行限制。"); }
     }
 
-    private static void CheckConfig()
+    private static string ReadPinnedConfig(string path, string expectedHash)
     {
-        if (!File.Exists(Config)) throw new AgentError("PCA103", "缺少 Config\\opencode.json。");
+        if (!File.Exists(path)) throw new AgentError("PCA103", "缺少固定配置文件：" + Path.GetFileName(path) + "。");
         try
         {
-            RejectLinkedPath(Config);
-            byte[] bytes = File.ReadAllBytes(Config);
+            RejectLinkedPath(path);
+            byte[] bytes = File.ReadAllBytes(path);
             using (SHA256 sha = SHA256.Create())
             {
                 string actual = BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "");
-                if (!string.Equals(actual, PinnedConfigHash, StringComparison.OrdinalIgnoreCase))
-                    throw new AgentError("PCA103", "配置文件与发布版不一致；请从已校验的发布包恢复。");
+                if (!string.Equals(actual, expectedHash, StringComparison.OrdinalIgnoreCase))
+                    throw new AgentError("PCA103", "固定配置文件校验失败：" + Path.GetFileName(path) + "。");
             }
+            string text;
             using (MemoryStream stream = new MemoryStream(bytes))
             using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, true))
-                ConfigText = reader.ReadToEnd();
-            if (!(Json.DeserializeObject(ConfigText) is Dictionary<string, object>))
-                throw new AgentError("PCA103", "Config\\opencode.json 不是有效 JSON 对象。");
+                text = reader.ReadToEnd();
+            if (!(Json.DeserializeObject(text) is Dictionary<string, object>))
+                throw new AgentError("PCA103", "固定配置文件不是有效 JSON 对象：" + Path.GetFileName(path) + "。");
+            return text;
         }
         catch (AgentError) { throw; }
-        catch { throw new AgentError("PCA103", "无法安全读取 Config\\opencode.json。"); }
+        catch { throw new AgentError("PCA103", "无法安全读取固定配置文件：" + Path.GetFileName(path) + "。"); }
+    }
+
+    private static void CheckConfig()
+    {
+        string manual = ReadPinnedConfig(Config, PinnedConfigHash);
+        string readonlyText = ReadPinnedConfig(ReadonlyConfig, PinnedReadonlyConfigHash);
+        string workspaceText = ReadPinnedConfig(WorkspaceConfig, PinnedWorkspaceConfigHash);
+        switch (ApprovalMode)
+        {
+            case "manual": ConfigText = manual; break;
+            case "readonly": ConfigText = readonlyText; break;
+            case "workspace": ConfigText = workspaceText; break;
+            default: throw new AgentError("PCA135", "未知审批档位。");
+        }
     }
 
     private static void CheckStorage()
@@ -368,10 +509,22 @@ internal static class PortableAgent
                     if ((item.Attributes & FileAttributes.ReparsePoint) != 0)
                         throw new AgentError("PCA122", "项目或便携配置包含链接文件/目录，未启动 Agent。");
                     bool folder = (item.Attributes & FileAttributes.Directory) != 0;
+                    // Dependency packages are not OpenCode configuration roots.
+                    if (global && folder && string.Equals(item.Name, "node_modules", StringComparison.OrdinalIgnoreCase))
+                        continue;
                     if (IsProjectConfigName(item.Name) ||
+                        (global && string.Equals(item.Name, "config.json", StringComparison.OrdinalIgnoreCase)) ||
                         (global && folder &&
                          (string.Equals(item.Name, "plugin", StringComparison.OrdinalIgnoreCase) ||
-                          string.Equals(item.Name, "plugins", StringComparison.OrdinalIgnoreCase))))
+                          string.Equals(item.Name, "plugins", StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(item.Name, "agent", StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(item.Name, "agents", StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(item.Name, "command", StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(item.Name, "commands", StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(item.Name, "skill", StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(item.Name, "skills", StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(item.Name, "tool", StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(item.Name, "tools", StringComparison.OrdinalIgnoreCase))))
                         throw new AgentError("PCA122", "项目或便携配置包含 OpenCode 配置/插件。请在个人电脑审查并移除后再启动。");
                     if (folder) pending.Push(item.FullName);
                 }
@@ -485,8 +638,11 @@ internal static class PortableAgent
 
     private static void SetChildEnvironment(ProcessStartInfo info)
     {
-        info.EnvironmentVariables["OPENCODE_CONFIG"] = Config;
+        // The verified full configuration stays in memory. Avoid a second disk read by OpenCode.
+        info.EnvironmentVariables["OPENCODE_CONFIG"] = Path.Combine(Data, "run",
+            ".verified-from-environment-" + Guid.NewGuid().ToString("N") + ".json");
         info.EnvironmentVariables["OPENCODE_CONFIG_CONTENT"] = ConfigText;
+        info.EnvironmentVariables.Remove("OPENCODE_PERMISSION");
         info.EnvironmentVariables["OPENCODE_CONFIG_DIR"] = Path.Combine(Data, "config");
         info.EnvironmentVariables["XDG_CONFIG_HOME"] = Path.Combine(Data, "config");
         info.EnvironmentVariables["XDG_DATA_HOME"] = Path.Combine(Data, "sessions");
@@ -509,21 +665,30 @@ internal static class PortableAgent
 
     private static int RunTui(string project)
     {
-        Log("启动 TUI。");
-        Console.WriteLine("正在打开终端界面，项目：" + project);
-        ProcessStartInfo info = new ProcessStartInfo(Exe, "--pure");
-        info.UseShellExecute = false;
-        info.WorkingDirectory = project;
-        SetChildEnvironment(info);
+        Process process;
         try
         {
-            using (Process process = Process.Start(info))
+            using (AcquireApprovalLock())
+            {
+                ApprovalMode = ReadApprovalMode();
+                CheckConfig();
+                Log("启动 TUI，审批档位 " + ApprovalMode + "。");
+                Console.WriteLine("正在打开终端界面，项目：" + project);
+                Console.WriteLine("审批档位：" + ApprovalLabel(ApprovalMode));
+                ProcessStartInfo info = new ProcessStartInfo(Exe, "--pure");
+                info.UseShellExecute = false;
+                info.WorkingDirectory = project;
+                SetChildEnvironment(info);
+                process = Process.Start(info);
+            }
+            using (process)
             {
                 process.WaitForExit();
                 Log("TUI 退出，代码 " + process.ExitCode + "。");
                 return process.ExitCode;
             }
         }
+        catch (AgentError) { throw; }
         catch { throw new AgentError("PCA119", "TUI 无法启动；请检查电脑执行限制。"); }
     }
 
@@ -614,6 +779,8 @@ internal static class PortableAgent
             {
                 if (!string.Equals(old.project, project, StringComparison.OrdinalIgnoreCase))
                     throw new AgentError("PCA118", "Web 服务已在另一项目运行；请先退出 Agent 再切换项目。");
+                if (!string.Equals(old.approvalMode, ApprovalMode, StringComparison.Ordinal))
+                    throw new AgentError("PCA132", "现有 Web 服务使用另一审批档位；请先运行“退出 Agent.cmd”再启动。");
                 if (!OwnsLoopbackPort(old.port, running.Id) || !IsHealthyWeb(old.port))
                     throw new AgentError("PCA118", "已有 Web 进程的端口或版本校验失败；未打开该地址。请先退出并重新启动。");
                 try { Process.Start("http://127.0.0.1:" + old.port + "/"); }
@@ -644,6 +811,7 @@ internal static class PortableAgent
                 state.exe = Exe;
                 state.port = port;
                 state.project = project;
+                state.approvalMode = ApprovalMode;
                 Directory.CreateDirectory(Path.GetDirectoryName(StateFile));
                 RejectLinkedPath(StateFile);
                 string temporary = StateFile + "." + Guid.NewGuid().ToString("N") + ".tmp";
@@ -654,6 +822,7 @@ internal static class PortableAgent
                 }
                 finally { if (File.Exists(temporary)) File.Delete(temporary); }
                 Console.WriteLine("Agent 已启动：http://127.0.0.1:" + port + "/");
+                Console.WriteLine("审批档位：" + ApprovalLabel(ApprovalMode));
                 Console.WriteLine("OpenCode Web 会打开浏览器；关闭标签页不会退出服务。完成任务后双击“退出 Agent.cmd”。");
                 Log("Web 就绪，端口 " + port + "，进程 " + process.Id + "。");
             }
@@ -766,6 +935,8 @@ internal static class PortableAgent
         Console.WriteLine("原生架构：" + GetArchitectureLabel());
         Console.WriteLine("OpenCode 程序：" + (File.Exists(Exe) ? "存在" : "缺失"));
         Console.WriteLine("配置文件：" + (File.Exists(Config) ? "存在" : "缺失"));
+        try { Console.WriteLine("审批档位：" + ApprovalLabel(ReadApprovalMode())); }
+        catch { Console.WriteLine("审批档位：设置文件无效"); }
         Console.WriteLine("密钥文件：" + (File.Exists(KeyFile) ? "已配置（内容不显示）" : "未配置"));
         if (File.Exists(Exe))
         {
