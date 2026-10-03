@@ -7,7 +7,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $expectedOpenCodeHash = 'da86eed515d91a7b2d7da9a8230a2bd095f68a89f0cf44eb6a9217bead81fffc'
-$expectedLauncherHash = 'dcb118d93b538b27ba1071db295e6fca15dcf02fd8e7d9c993576e2108d08ee0'
+$expectedLauncherHash = '94db87b47eda36aea63cc1aad19d280f48054c7065fc1924b200e75f01e901a0'
 $dummyKey = 'sk-VERIFY-00000000000000000000000000000000'
 $results = [Collections.Generic.List[object]]::new()
 if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
@@ -344,6 +344,51 @@ else {
                 Record 'approval-guard' 'PASS' 'Running Web state blocks a switch; invalid mode fails closed.'
             }
             else { Record 'approval-guard' 'FAIL' 'Approval switch guard or invalid mode handling failed.' }
+
+            # A moved USB must recover stale state without stopping a reused/live PID.
+            $testProcess = [Diagnostics.Process]::GetCurrentProcess()
+            $staleCases = @(
+                @{ name = 'stale-cross-root'; pid = 2147483646; ticks = 1 },
+                @{ name = 'stale-reused-pid'; pid = $testProcess.Id;
+                   ticks = $testProcess.StartTime.ToUniversalTime().Ticks - [TimeSpan]::TicksPerMinute }
+            )
+            foreach ($case in $staleCases) {
+                $stale = @{ pid = $case.pid; startTicksUtc = $case.ticks;
+                    exe = 'Z:\OldUsb\Agent\opencode.exe'; port = 4096;
+                    project = 'Z:\OldUsb\Workspace'; approvalMode = 'manual' } | ConvertTo-Json -Compress
+                $before = @(Get-ChildItem -LiteralPath (Split-Path $statePath) -Filter 'web-server.stale-*.json').Count
+                [IO.File]::WriteAllText($statePath, $stale, [Text.UTF8Encoding]::new($false))
+                $stopped = Invoke-Native $fixtureApp 'stop'
+                $archives = @(Get-ChildItem -LiteralPath (Split-Path $statePath) -Filter 'web-server.stale-*.json')
+                $testProcess.Refresh()
+                if ($stopped.code -eq 0 -and -not (Test-Path -LiteralPath $statePath) -and
+                    $archives.Count -eq $before + 1 -and -not $testProcess.HasExited -and
+                    @($archives | Where-Object { [IO.File]::ReadAllText($_.FullName) -eq $stale }).Count -ge 1) {
+                    Record $case.name 'PASS' 'Stale cross-root record archived; no unrelated process stopped.'
+                }
+                else { Record $case.name 'FAIL' ('Stale record recovery failed: ' + $stopped.output) }
+                if (Test-Path -LiteralPath $statePath) { Remove-Item -LiteralPath $statePath -Force }
+            }
+            $live = @{ pid = $testProcess.Id; startTicksUtc = $testProcess.StartTime.ToUniversalTime().Ticks;
+                exe = $testProcess.MainModule.FileName; port = 4096;
+                project = $fixture; approvalMode = 'manual' } | ConvertTo-Json -Compress
+            [IO.File]::WriteAllText($statePath, $live, [Text.UTF8Encoding]::new($false))
+            $liveStop = Invoke-Native $fixtureApp 'stop'
+            $testProcess.Refresh()
+            if ($liveStop.code -ne 0 -and $liveStop.output -match 'PCA202' -and
+                [IO.File]::ReadAllText($statePath) -eq $live -and -not $testProcess.HasExited) {
+                Record 'live-state-guard' 'PASS' 'Live process from another executable retained and not stopped.'
+            }
+            else { Record 'live-state-guard' 'FAIL' 'Live unrelated process record was not protected.' }
+            [IO.File]::WriteAllText($statePath, '{}', [Text.UTF8Encoding]::new($false))
+            $invalidStop = Invoke-Native $fixtureApp 'stop'
+            if ($invalidStop.code -ne 0 -and $invalidStop.output -match 'PCA201' -and
+                [IO.File]::ReadAllText($statePath) -eq '{}') {
+                Record 'malformed-state-guard' 'PASS' 'Malformed service record retained for diagnosis.'
+            }
+            else { Record 'malformed-state-guard' 'FAIL' 'Malformed service record was not protected.' }
+            Remove-Item -LiteralPath $statePath -Force
+            $testProcess.Dispose()
 
             $absentExe = Invoke-Native $fixtureApp 'preflight --api-base-url http://127.0.0.1:9'
             if ($absentExe.code -ne 0 -and $absentExe.output -match 'PCA102' -and

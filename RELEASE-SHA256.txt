@@ -1,4 +1,4 @@
-# v1.18.32-portable.2
-703bbc1d5ac5619c21b483fe4c88fa1938e693065576433c2aabd0e1e5e6f538  Portable-Agent-v1.18.32.zip
-dcb118d93b538b27ba1071db295e6fca15dcf02fd8e7d9c993576e2108d08ee0  Portable-Agent/Launcher/PortableAgent.exe
+# v1.18.32-portable.3
+caf2153a75c53dd3874e97c8efd3acebe078c28e2f04be4a780c0c9ed2abc1ea  Portable-Agent-v1.18.32.zip
+94db87b47eda36aea63cc1aad19d280f48054c7065fc1924b200e75f01e901a0  Portable-Agent/Launcher/PortableAgent.exe
 da86eed515d91a7b2d7da9a8230a2bd095f68a89f0cf44eb6a9217bead81fffc  Portable-Agent/Agent/opencode.exe

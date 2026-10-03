@@ -700,6 +700,49 @@ internal static class PortableAgent
         catch { return null; }
     }
 
+    // Called under the shared launcher lock. A mismatched PID can belong to another app.
+    private static bool TryClearStaleWebState(ServerState state)
+    {
+        if (state == null || state.pid <= 0 || state.startTicksUtc <= 0 ||
+            state.port < 1 || state.port > 65535 || string.IsNullOrWhiteSpace(state.exe) ||
+            !Path.IsPathRooted(state.exe))
+            throw new AgentError("PCA201", "服务记录损坏，无法安全识别进程。");
+        bool stale;
+        Process process = null;
+        try
+        {
+            try { process = Process.GetProcessById(state.pid); }
+            catch (ArgumentException) { return ArchiveStaleWebState(); }
+            stale = process.HasExited ||
+                process.StartTime.ToUniversalTime().Ticks != state.startTicksUtc ||
+                !string.Equals(process.MainModule.FileName, state.exe, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (AgentError) { throw; }
+        catch
+        {
+            throw new AgentError("PCA202", "无法核实旧服务进程；已保留记录，未终止任何进程。");
+        }
+        finally { if (process != null) process.Dispose(); }
+        return stale && ArchiveStaleWebState();
+    }
+
+    private static bool ArchiveStaleWebState()
+    {
+        string backup = Path.Combine(Path.GetDirectoryName(StateFile),
+            "web-server.stale-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss") + "-" +
+            Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            RejectLinkedPath(StateFile);
+            RejectLinkedPath(backup);
+            File.Move(StateFile, backup);
+        }
+        catch { throw new AgentError("PCA204", "旧服务已失效，但无法备份记录；请检查 U 盘写入权限。"); }
+        Log("旧 Web 服务记录已失效；已备份并清理（未终止任何进程）。");
+        Console.WriteLine("已备份并清理失效的 Web 服务记录，可在当前电脑重新启动。");
+        return true;
+    }
+
     private static Process ProcessForState(ServerState state)
     {
         if (state == null || state.pid <= 0 || state.startTicksUtc <= 0 ||
@@ -770,6 +813,11 @@ internal static class PortableAgent
         ServerState old = ReadState();
         if (stateExists && old == null)
             throw new AgentError("PCA201", "Web 服务记录损坏；为避免遗留服务，未再次启动。请检查诊断并确认旧进程已结束。");
+        if (stateExists && TryClearStaleWebState(old))
+        {
+            old = null;
+            stateExists = false;
+        }
         Process running = ProcessForState(old);
         if (stateExists && running == null)
             throw new AgentError("PCA201", "Web 服务记录未匹配到当前进程；请先运行“退出 Agent.cmd”清理旧记录。");
@@ -888,42 +936,47 @@ internal static class PortableAgent
             Console.WriteLine("没有由本 U 盘启动器记录的 Web 服务。");
             return;
         }
-        ServerState state = ReadState();
-        if (state == null || state.pid <= 0 || state.startTicksUtc <= 0)
-            throw new AgentError("PCA201", "服务记录损坏，无法安全识别进程。");
-        if (!string.Equals(state.exe, Exe, StringComparison.OrdinalIgnoreCase))
-            throw new AgentError("PCA202", "服务记录中的程序路径与本 U 盘不符；未终止任何进程。");
-        Process candidate;
-        try { candidate = Process.GetProcessById(state.pid); }
-        catch (ArgumentException)
+        using (AcquireApprovalLock())
         {
-            File.Delete(StateFile);
-            Log("清理已结束服务的记录。");
-            Console.WriteLine("Web 服务已经退出；已清理旧记录。");
-            return;
-        }
-        using (candidate)
-        {
-            Process checkedProcess = ProcessForState(state);
-            if (checkedProcess == null)
-                throw new AgentError("PCA202", "进程身份与服务记录不符；为避免误杀，未终止任何进程。");
-            checkedProcess.Dispose();
-            TryDispose(candidate, state.port);
-            try
+            if (!File.Exists(StateFile))
             {
-                candidate.Refresh();
-                if (!candidate.HasExited)
-                {
-                    candidate.Kill();
-                    if (!candidate.WaitForExit(10000))
-                        throw new AgentError("PCA203", "已请求退出，但进程仍在运行。");
-                }
+                Console.WriteLine("Web 服务记录已由另一启动器清理。");
+                return;
             }
-            catch (AgentError) { throw; }
-            catch { throw new AgentError("PCA203", "无法终止已识别的 Web 服务。"); }
-            File.Delete(StateFile);
-            Log("Web 服务已退出，进程 " + candidate.Id + "。");
-            Console.WriteLine("Agent Web 服务已退出。请关闭浏览器并安全弹出 U 盘。");
+            ServerState state = ReadState();
+            if (TryClearStaleWebState(state)) return;
+            if (!string.Equals(state.exe, Exe, StringComparison.OrdinalIgnoreCase))
+                throw new AgentError("PCA202", "服务记录中的程序路径与本 U 盘不符；未终止任何进程。");
+            Process candidate;
+            try { candidate = Process.GetProcessById(state.pid); }
+            catch (ArgumentException)
+            {
+                ArchiveStaleWebState();
+                return;
+            }
+            using (candidate)
+            {
+                Process checkedProcess = ProcessForState(state);
+                if (checkedProcess == null)
+                    throw new AgentError("PCA202", "进程身份与服务记录不符；为避免误杀，未终止任何进程。");
+                checkedProcess.Dispose();
+                TryDispose(candidate, state.port);
+                try
+                {
+                    candidate.Refresh();
+                    if (!candidate.HasExited)
+                    {
+                        candidate.Kill();
+                        if (!candidate.WaitForExit(10000))
+                            throw new AgentError("PCA203", "已请求退出，但进程仍在运行。");
+                    }
+                }
+                catch (AgentError) { throw; }
+                catch { throw new AgentError("PCA203", "无法终止已识别的 Web 服务。"); }
+                File.Delete(StateFile);
+                Log("Web 服务已退出，进程 " + candidate.Id + "。");
+                Console.WriteLine("Agent Web 服务已退出。请关闭浏览器并安全弹出 U 盘。");
+            }
         }
     }
 
